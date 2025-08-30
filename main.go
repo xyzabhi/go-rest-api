@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"context"
 	"log"
@@ -39,9 +42,55 @@ func main() {
 	// GET /users -> list all users
 	// ------------------------------
 	r.GET("/users", func(c *gin.Context) {
-		// Query all users
-		rows, err := db.Query(c,
-			"SELECT id, name, email, created_at, updated_at FROM users ORDER BY id")
+		// --- Parse query params ---
+		limit := 10
+		offset := 0
+		q := c.Query("q") // search term
+		sortBy := c.DefaultQuery("sort", "id")
+		order := c.DefaultQuery("order", "asc")
+
+		// Validate limit (default 10, max 100)
+		if l := c.Query("limit"); l != "" {
+			if n, err := strconv.Atoi(l); err == nil && n > 0 && n <= 100 {
+				limit = n
+			}
+		}
+
+		// Validate offset
+		if o := c.Query("offset"); o != "" {
+			if n, err := strconv.Atoi(o); err == nil && n >= 0 {
+				offset = n
+			}
+		}
+
+		// Validate sortBy
+		validSort := map[string]bool{"id": true, "name": true, "email": true}
+		if !validSort[sortBy] {
+			sortBy = "id"
+		}
+
+		// Validate order
+		if order != "asc" && order != "desc" {
+			order = "asc"
+		}
+
+		// --- Build query ---
+		query := `
+			SELECT id, name, email, created_at, updated_at
+			FROM users
+		`
+		var args []any
+		if q != "" {
+			// Use ILIKE for case-insensitive search
+			query += "WHERE name ILIKE $1 OR email ILIKE $1 "
+			args = append(args, "%"+q+"%")
+		}
+
+		// ORDER BY + LIMIT/OFFSET
+		query += fmt.Sprintf("ORDER BY %s %s LIMIT %d OFFSET %d", sortBy, strings.ToUpper(order), limit, offset)
+
+		// --- Execute query ---
+		rows, err := db.Query(c, query, args...)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -51,7 +100,6 @@ func main() {
 		var users []User
 		for rows.Next() {
 			var u User
-			// Scan each row into a User struct
 			if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt, &u.UpdatedAt); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
@@ -59,8 +107,15 @@ func main() {
 			users = append(users, u)
 		}
 
-		// Respond with JSON array of users
-		c.JSON(http.StatusOK, users)
+		// --- Return response with metadata ---
+		c.JSON(http.StatusOK, gin.H{
+			"items":  users,
+			"limit":  limit,
+			"offset": offset,
+			"sort":   sortBy,
+			"order":  order,
+			"query":  q,
+		})
 	})
 
 	// --------------------------------

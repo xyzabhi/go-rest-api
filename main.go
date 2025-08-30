@@ -3,89 +3,117 @@ package main
 import (
 	"net/http"
 
+	"context"
+	"log"
+	"os"
+	"time"
+
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// User Model
-type User struct {
-	ID    int    `json:"id"`
-	Name  string `json:"name"`
-	Email string `json:"email"`
-}
-
-var users = []User{
-	{ID: 1, Name: "John Doe", Email: "john@example.com"},
-	{ID: 2, Name: "Jane Smith", Email: "jane@example.com"},
-	{ID: 3, Name: "Alice Johnson", Email: "alice@example.com"},
-}
-
 func main() {
+
 	//Create Gin Router
 	r := gin.Default()
+
+	//Connect to DB
+	db := ConnectDB()
+	//Always close db connections when app exits
+	defer db.Close()
 	//simple route
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
-	//get all users
+	//get all users from DB
 	r.GET("/users", func(c *gin.Context) {
+		//Run select query
+		rows, err := db.Query(c, "SELECT id,name,email,created_at,updated_at FROM users ORDER BY id ASC")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		//Always close rows when done
+		defer rows.Close()
+		//Build response slice
+		var users []map[string]any
+		for rows.Next() {
+			var id int
+			var name, email string
+			var createdAt, updatedAt time.Time
+			//Scan rows into go vars
+			err := rows.Scan(&id, &name, &email, &createdAt, &updatedAt)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+				return
+			}
+			//Append users to response slice
+			users = append(users, map[string]any{
+				"id": id, "name": name, "email": email, "created_at": createdAt, "updated_at": updatedAt})
+		}
 		c.JSON(http.StatusOK, users)
 	})
 
 	//get user by id
 	r.GET("/users/:id", func(c *gin.Context) {
-		id := c.Param("id")
-		for _, u := range users {
-			if id == string(rune(u.ID+'0')) {
-				c.JSON(http.StatusOK, u)
-				return
-			}
-		}
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+
 	})
 
 	//Create a user
 	r.POST("/users", func(c *gin.Context) {
-		var newUser User
-		if err := c.ShouldBindJSON(&newUser); err != nil {
+		//Struct input payload
+		var input struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+		}
+		//Bind the JSON to struct
+		if err := c.ShouldBind(&input); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		newUser.ID = len(users) + 1
-		users = append(users, newUser)
-		c.JSON(http.StatusCreated, newUser)
+		// Insert user into DB, return the new ID
+		var id int
+		err := db.QueryRow(c, "INSERT INTO users (name,email) VALUES ($1,$2) RETURNING id", input.Name, input.Email).Scan(&id)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		//Return the new user with the ID
+		c.JSON(http.StatusCreated, gin.H{"id": id, "name": input.Name, "email": input.Email})
 	})
 
 	//Update a user
 	r.PUT("/users/:id", func(c *gin.Context) {
-		id := c.Param("id")
-		for i, u := range users {
-			if id == string(rune(u.ID+'0')) {
-				var updatedUser User
-				if err := c.ShouldBindJSON(&updatedUser); err != nil {
-					c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-					return
-				}
-				users[i] = updatedUser
-				c.JSON(http.StatusOK, updatedUser)
-				return
-			}
-		}
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+
 	})
 
 	//Delete a user
 	r.DELETE("/users/:id", func(c *gin.Context) {
-		id := c.Param("id")
-		for i, u := range users {
-			if id == string(rune(u.ID+'0')) {
-				users = append(users[:i], users[i+1:]...)
-				c.JSON(http.StatusOK, gin.H{"message": "User deleted"})
-				return
-			}
-		}
-		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
+
 	})
 
 	r.Run(":8080")
+}
+
+// connectDB establishes a connection to the PostgreSQL database
+func ConnectDB() *pgxpool.Pool {
+	//DB connection string from eniv
+	url := os.Getenv("DB_URL")
+	if url == "" {
+		url = "postgres://app:app@localhost:15432/appdb?sslmode=disable"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		log.Fatalf("❌ Failed to connect to database: %v", err)
+	}
+
+	//test the connection
+	if err := pool.Ping(ctx); err != nil {
+		log.Fatalf("❌ Failed to ping database: %v", err)
+	}
+	log.Println("✅ Connected to database")
+	return pool
 }

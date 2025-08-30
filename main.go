@@ -12,87 +12,173 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-func main() {
+// User struct maps directly to the "users" table in Postgres.
+// The JSON tags control how the struct is serialized/deserialized in API responses.
+type User struct {
+	ID        int       `json:"id"`         // primary key
+	Name      string    `json:"name"`       // user name
+	Email     string    `json:"email"`      // unique email
+	CreatedAt time.Time `json:"created_at"` // timestamp when user was created
+	UpdatedAt time.Time `json:"updated_at"` // timestamp when user was last updated
+}
 
-	//Create Gin Router
+func main() {
+	// Connect to Postgres using pgxpool (see db.go)
+	db := ConnectDB()
+	defer db.Close()
+
+	// Create a Gin router with default middleware (logger + recovery)
 	r := gin.Default()
 
-	//Connect to DB
-	db := ConnectDB()
-	//Always close db connections when app exits
-	defer db.Close()
-	//simple route
+	// Health check route
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
-	//get all users from DB
+	// ------------------------------
+	// GET /users -> list all users
+	// ------------------------------
 	r.GET("/users", func(c *gin.Context) {
-		//Run select query
-		rows, err := db.Query(c, "SELECT id,name,email,created_at,updated_at FROM users ORDER BY id ASC")
+		// Query all users
+		rows, err := db.Query(c,
+			"SELECT id, name, email, created_at, updated_at FROM users ORDER BY id")
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		//Always close rows when done
 		defer rows.Close()
-		//Build response slice
-		var users []map[string]any
+
+		var users []User
 		for rows.Next() {
-			var id int
-			var name, email string
-			var createdAt, updatedAt time.Time
-			//Scan rows into go vars
-			err := rows.Scan(&id, &name, &email, &createdAt, &updatedAt)
-			if err != nil {
+			var u User
+			// Scan each row into a User struct
+			if err := rows.Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt, &u.UpdatedAt); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				return
 			}
-			//Append users to response slice
-			users = append(users, map[string]any{
-				"id": id, "name": name, "email": email, "created_at": createdAt, "updated_at": updatedAt})
+			users = append(users, u)
 		}
+
+		// Respond with JSON array of users
 		c.JSON(http.StatusOK, users)
 	})
 
-	//get user by id
+	// --------------------------------
+	// GET /users/:id -> get user by ID
+	// --------------------------------
 	r.GET("/users/:id", func(c *gin.Context) {
+		id := c.Param("id") // get id from URL path
 
+		var u User
+		// Query single user by ID
+		err := db.QueryRow(c,
+			"SELECT id, name, email, created_at, updated_at FROM users WHERE id=$1",
+			id,
+		).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt, &u.UpdatedAt)
+
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+
+		// Respond with single user object
+		c.JSON(http.StatusOK, u)
 	})
 
-	//Create a user
+	// -------------------------------
+	// POST /users -> create new user
+	// -------------------------------
 	r.POST("/users", func(c *gin.Context) {
-		//Struct input payload
+		// Input struct for request body
 		var input struct {
 			Name  string `json:"name"`
 			Email string `json:"email"`
 		}
-		//Bind the JSON to struct
-		if err := c.ShouldBind(&input); err != nil {
+
+		// Bind JSON body into input struct
+		if err := c.ShouldBindJSON(&input); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
-		// Insert user into DB, return the new ID
-		var id int
-		err := db.QueryRow(c, "INSERT INTO users (name,email) VALUES ($1,$2) RETURNING id", input.Name, input.Email).Scan(&id)
+
+		// Insert user into DB and return full user row
+		var u User
+		err := db.QueryRow(c,
+			`INSERT INTO users (name, email)
+			 VALUES ($1, $2)
+			 RETURNING id, name, email, created_at, updated_at`,
+			input.Name, input.Email,
+		).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt, &u.UpdatedAt)
+
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		//Return the new user with the ID
-		c.JSON(http.StatusCreated, gin.H{"id": id, "name": input.Name, "email": input.Email})
+
+		// Respond with the created user
+		c.JSON(http.StatusCreated, u)
 	})
 
-	//Update a user
+	// ----------------------------------
+	// PUT /users/:id -> update user info
+	// ----------------------------------
 	r.PUT("/users/:id", func(c *gin.Context) {
+		id := c.Param("id")
 
+		// Input struct for update payload
+		var input struct {
+			Name  string `json:"name"`
+			Email string `json:"email"`
+		}
+
+		// Parse JSON request body
+		if err := c.ShouldBindJSON(&input); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		// Update user and return updated row
+		var u User
+		err := db.QueryRow(c,
+			`UPDATE users
+			 SET name=$2, email=$3, updated_at=now()
+			 WHERE id=$1
+			 RETURNING id, name, email, created_at, updated_at`,
+			id, input.Name, input.Email,
+		).Scan(&u.ID, &u.Name, &u.Email, &u.CreatedAt, &u.UpdatedAt)
+
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+
+		c.JSON(http.StatusOK, u)
 	})
 
-	//Delete a user
+	// ----------------------------------
+	// DELETE /users/:id -> delete a user
+	// ----------------------------------
 	r.DELETE("/users/:id", func(c *gin.Context) {
+		id := c.Param("id")
 
+		// Run DELETE query
+		res, err := db.Exec(c, "DELETE FROM users WHERE id=$1", id)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+
+		// If no row was deleted, user doesn’t exist
+		if res.RowsAffected() == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		}
+
+		// Respond with confirmation
+		c.JSON(http.StatusOK, gin.H{"message": "user deleted"})
 	})
 
+	// Start server on port 8080
 	r.Run(":8080")
 }
 
